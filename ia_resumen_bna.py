@@ -18,13 +18,26 @@ FAVICON = HERE / "favicon-aie.ico"
 st.set_page_config(
     page_title="IA Resumen Bancario – Banco Nación",
     page_icon=str(FAVICON) if FAVICON.exists() else None,
-    layout="wide",
+    layout="centered",
 )
 
 if LOGO.exists():
     st.image(str(LOGO), width=200)
 
 st.title("IA Resumen Bancario – Banco Nación")
+
+
+# --- Estilo: ancho contenido (similar a app "centrada") ---
+st.markdown(
+    """
+    <style>
+      /* limita el ancho del contenido para evitar una vista "muy ancha" */
+      .block-container { max-width: 900px; padding-top: 2rem; padding-bottom: 2rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # ---------------- deps diferidas ----------------
 try:
@@ -336,29 +349,40 @@ def bna_extract_meta(file_like):
 
 
 def bna_extract_gastos_finales(txt: str) -> dict:
-    """Extrae el bloque posterior a SALDO FINAL:
-    - INTERESES
-    - COMISION
-    - SELLADOS
-    - I.V.A. BASE
-    - SEGURO DE VIDA
+    """
+    Extrae los importes del bloque post "SALDO FINAL" del PDF BNA.
+
+    Reglas:
+    - INTERESES y COMISION se suman al NETO 10,5% del Resumen Operativo.
+    - I.V.A. BASE se suma al IVA 10,5% del Resumen Operativo.
+    - I.V.A. RG.3337 se suma a Percepciones de IVA (NO debe mezclarse con I.V.A. BASE).
+    - SELLADOS y SEGURO DE VIDA son exentos (no se muestran si el usuario no lo pide).
     """
     scope = txt or ""
     pos = scope.upper().rfind("SALDO FINAL")
     if pos != -1:
         scope = scope[pos:]  # solo desde SALDO FINAL hacia abajo
 
-    out = {}
+    out: dict[str, float] = {}
     for m in BNA_GASTOS_RE.finditer(scope):
-        etiqueta = m.group(1).upper()
-        # Normalización de variantes
-        if "RG" in etiqueta and "3337" in etiqueta:
-            etiqueta = "I.V.A. RG.3337"
+        etiqueta_raw = (m.group(1) or "").strip().upper()
         importe = normalize_money(m.group(2))
-        if "I.V.A" in etiqueta or "IVA" in etiqueta:
+
+        if importe is None or (isinstance(importe, float) and np.isnan(importe)):
+            continue
+
+        # Normalización (orden importa)
+        if "RG" in etiqueta_raw and "3337" in etiqueta_raw:
+            etiqueta = "I.V.A. RG.3337"
+        elif "I.V.A" in etiqueta_raw or "IVA" in etiqueta_raw:
             etiqueta = "I.V.A. BASE"
-        out[etiqueta] = float(importe) if not np.isnan(importe) else np.nan
+        else:
+            etiqueta = etiqueta_raw
+
+        out[etiqueta] = float(out.get(etiqueta, 0.0)) + float(importe)
+
     return out
+
 
 
 # ---------------- reporte principal ----------------
