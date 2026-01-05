@@ -449,6 +449,20 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
     if pd.notna(fecha_cierre):
         st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
+    # ----- Pre-cálculo BNA: gastos post SALDO FINAL (sin fecha) -----
+    # Se calculan antes del Resumen Operativo porque impactan en el módulo IVA
+    intereses = float(bna_extras.get("INTERESES", 0.0) or 0.0)
+    comision  = float(bna_extras.get("COMISION", 0.0) or 0.0)
+    sellados  = float(bna_extras.get("SELLADOS", 0.0) or 0.0)
+    iva_base  = float(bna_extras.get("I.V.A. BASE", 0.0) or 0.0)
+    seg_vida  = float(bna_extras.get("SEGURO DE VIDA", 0.0) or 0.0)
+    rg3337    = float(bna_extras.get("I.V.A. RG.3337", 0.0) or 0.0)
+
+    neto_105_extra = intereses + comision
+    iva_105_extra  = iva_base
+    exentos_extra  = sellados + seg_vida
+
+
     # ===== Resumen Operativo (IVA + Otros) =====
     st.caption("Resumen Operativo: Registración Módulo IVA")
 
@@ -508,16 +522,6 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
 
     # ----- Gastos post SALDO FINAL (sin fecha) -----
     st.caption("Gastos post SALDO FINAL (sin fecha)")
-    intereses = float(bna_extras.get("INTERESES", 0.0) or 0.0)
-    comision  = float(bna_extras.get("COMISION", 0.0) or 0.0)
-    sellados  = float(bna_extras.get("SELLADOS", 0.0) or 0.0)
-    iva_base  = float(bna_extras.get("I.V.A. BASE", 0.0) or 0.0)
-    seg_vida  = float(bna_extras.get("SEGURO DE VIDA", 0.0) or 0.0)
-    rg3337   = float(bna_extras.get("I.V.A. RG.3337", 0.0) or 0.0)
-
-    neto_105_extra = intereses + comision
-    iva_105_extra  = iva_base
-    exentos_extra  = sellados + seg_vida
 
     e1, e2, e3 = st.columns(3)
     with e1:
