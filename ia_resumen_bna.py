@@ -394,6 +394,9 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
     fecha_cierre, saldo_final_pdf = find_saldo_final_from_lines(lines)
     saldo_anterior = find_saldo_anterior_from_lines(lines)
 
+    # Sufijos de nombre de archivo (reutilizados en descargas)
+
+
     if df.empty:
         st.warning("No se detectaron movimientos con fecha en el PDF.")
         return
