@@ -76,7 +76,7 @@ BNA_ACC_ONLY_RE = re.compile(
 
 # Bloque de gastos finales post “SALDO FINAL”
 BNA_GASTOS_RE = re.compile(
-    r"-\s*(INTERESES|COMISION|SELLADOS|I\.V\.A\.?\s*BASE|SEGURO\s+DE\s+VIDA)\s*\$\s*([0-9\.\s]+,\d{2})",
+    r"-\s*(INTERESES|COMISION|SELLADOS|I\.V\.A\.?\s*BASE|SEGURO\s+DE\s+VIDA|I\.V\.A\.?\s*RG\.?\s*3337|IVA\s*RG\.?\s*3337)\s*\$\s*([0-9\.\s]+,\d{2})",
     re.IGNORECASE,
 )
 
@@ -352,6 +352,9 @@ def bna_extract_gastos_finales(txt: str) -> dict:
     out = {}
     for m in BNA_GASTOS_RE.finditer(scope):
         etiqueta = m.group(1).upper()
+        # Normalización de variantes
+        if "RG" in etiqueta and "3337" in etiqueta:
+            etiqueta = "I.V.A. RG.3337"
         importe = normalize_money(m.group(2))
         if "I.V.A" in etiqueta or "IVA" in etiqueta:
             etiqueta = "I.V.A. BASE"
@@ -446,38 +449,6 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
     if pd.notna(fecha_cierre):
         st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
-    # ----- Gastos post SALDO FINAL (sin fecha) -----
-    st.caption("Gastos post SALDO FINAL (sin fecha)")
-    intereses = float(bna_extras.get("INTERESES", 0.0) or 0.0)
-    comision  = float(bna_extras.get("COMISION", 0.0) or 0.0)
-    sellados  = float(bna_extras.get("SELLADOS", 0.0) or 0.0)
-    iva_base  = float(bna_extras.get("I.V.A. BASE", 0.0) or 0.0)
-    seg_vida  = float(bna_extras.get("SEGURO DE VIDA", 0.0) or 0.0)
-
-    neto_105_extra = intereses + comision
-    iva_105_extra  = iva_base
-    exentos_extra  = sellados + seg_vida
-
-    e1, e2, e3 = st.columns(3)
-    with e1:
-        st.metric("Neto 10,5% (Intereses + Comisión)", f"$ {fmt_ar(neto_105_extra)}")
-    with e2:
-        st.metric("IVA 10,5% (I.V.A. BASE)", f"$ {fmt_ar(iva_105_extra)}")
-    with e3:
-        st.metric("Exentos (Sellados + Seguro de vida)", f"$ {fmt_ar(exentos_extra)}")
-
-    extras_rows = [
-        {"Concepto": "INTERESES",      "Tratamiento": "Neto 10,5%", "Importe": intereses},
-        {"Concepto": "COMISION",       "Tratamiento": "Neto 10,5%", "Importe": comision},
-        {"Concepto": "I.V.A. BASE",    "Tratamiento": "IVA 10,5%",  "Importe": iva_base},
-        {"Concepto": "SELLADOS",       "Tratamiento": "Exento",     "Importe": sellados},
-        {"Concepto": "SEGURO DE VIDA", "Tratamiento": "Exento",     "Importe": seg_vida},
-    ]
-    df_extras = pd.DataFrame(extras_rows)
-    df_extras_view = df_extras.copy()
-    df_extras_view["Importe"] = df_extras_view["Importe"].map(fmt_ar)
-    st.dataframe(df_extras_view, use_container_width=True)
-
     # ===== Resumen Operativo (IVA + Otros) =====
     st.caption("Resumen Operativo: Registración Módulo IVA")
 
@@ -496,7 +467,9 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
     iva105 = iva105_mov + iva_105_extra
 
     # Otros conceptos
-    percep_iva = float(df_sorted.loc[df_sorted["Clasificación"].eq("Percepciones de IVA"), "debito"].sum())
+    percep_iva_mov = float(df_sorted.loc[df_sorted["Clasificación"].eq("Percepciones de IVA"), "debito"].sum())
+    percep_iva_extra = float(rg3337 or 0.0)
+    percep_iva = percep_iva_mov + percep_iva_extra
     ley_25413  = float(df_sorted.loc[df_sorted["Clasificación"].eq("LEY 25.413"),          "debito"].sum())
     sircreb    = float(df_sorted.loc[df_sorted["Clasificación"].eq("SIRCREB"),            "debito"].sum())
 
@@ -533,13 +506,38 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
     with x3:
         st.metric("Total general (incluye exentos post SALDO FINAL)", f"$ {fmt_ar(net21_mov + iva21_mov + net105 + iva105 + percep_iva + ley_25413 + sircreb + exentos_extra)}")
 
-    # ----- Detalle de movimientos -----
-    st.caption("Detalle de movimientos")
-    df_view = df_sorted.copy()
-    for c in ["debito", "credito", "importe", "saldo"]:
-        if c in df_view.columns:
-            df_view[c] = df_view[c].map(fmt_ar)
-    st.dataframe(df_view, use_container_width=True)
+    # ----- Gastos post SALDO FINAL (sin fecha) -----
+    st.caption("Gastos post SALDO FINAL (sin fecha)")
+    intereses = float(bna_extras.get("INTERESES", 0.0) or 0.0)
+    comision  = float(bna_extras.get("COMISION", 0.0) or 0.0)
+    sellados  = float(bna_extras.get("SELLADOS", 0.0) or 0.0)
+    iva_base  = float(bna_extras.get("I.V.A. BASE", 0.0) or 0.0)
+    seg_vida  = float(bna_extras.get("SEGURO DE VIDA", 0.0) or 0.0)
+    rg3337   = float(bna_extras.get("I.V.A. RG.3337", 0.0) or 0.0)
+
+    neto_105_extra = intereses + comision
+    iva_105_extra  = iva_base
+    exentos_extra  = sellados + seg_vida
+
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        st.metric("Neto 10,5% (Intereses + Comisión)", f"$ {fmt_ar(neto_105_extra)}")
+    with e2:
+        st.metric("IVA 10,5% (I.V.A. BASE)", f"$ {fmt_ar(iva_105_extra)}")
+    with e3:
+        st.metric("Exentos (Sellados + Seguro de vida)", f"$ {fmt_ar(exentos_extra)}")
+
+    extras_rows = [
+        {"Concepto": "INTERESES",      "Tratamiento": "Neto 10,5%", "Importe": intereses},
+        {"Concepto": "COMISION",       "Tratamiento": "Neto 10,5%", "Importe": comision},
+        {"Concepto": "I.V.A. BASE",    "Tratamiento": "IVA 10,5%",  "Importe": iva_base},
+        {"Concepto": "SELLADOS",       "Tratamiento": "Exento",     "Importe": sellados},
+        {"Concepto": "SEGURO DE VIDA", "Tratamiento": "Exento",     "Importe": seg_vida},
+    ]
+    df_extras = pd.DataFrame(extras_rows)
+    df_extras_view = df_extras.copy()
+    df_extras_view["Importe"] = df_extras_view["Importe"].map(fmt_ar)
+    st.dataframe(df_extras_view, use_container_width=True)
 
     # ----- Detalle de créditos / préstamos (debitados o acreditados) -----
     st.caption("Detalle de créditos / préstamos (debitados o acreditados)")
@@ -563,6 +561,14 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
         for c in ["debito", "credito", "importe", "saldo"]:
             df_cred_view[c] = df_cred_view[c].map(fmt_ar)
         st.dataframe(df_cred_view, use_container_width=True)
+
+    # ----- Detalle de movimientos -----
+    st.caption("Detalle de movimientos")
+    df_view = df_sorted.copy()
+    for c in ["debito", "credito", "importe", "saldo"]:
+        if c in df_view.columns:
+            df_view[c] = df_view[c].map(fmt_ar)
+    st.dataframe(df_view, use_container_width=True)
 
     # ----- Descargas -----
     st.caption("Descargar")
@@ -709,9 +715,6 @@ if not txt_full:
     )
     st.stop()
 
-# Verificación suave
-if BNA_NAME_HINT not in txt_full.upper():
-    st.warning("El PDF no parece ser del Banco Nación (BNA). Se intentará procesar igualmente.")
 
 meta = bna_extract_meta(io.BytesIO(data))
 all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
