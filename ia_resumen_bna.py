@@ -252,7 +252,6 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
         return "IVA 21% (sobre comisiones)"
 
     # Plazo Fijo (según signo)
- (según signo)
     if ("PLAZO FIJO" in u) or ("PLAZO FIJO" in n) or ("P.FIJO" in u) or ("P.FIJO" in n) or ("P FIJO" in u) or ("P FIJO" in n):
         if cre and cre != 0:
             return "Acreditación Plazo Fijo"
