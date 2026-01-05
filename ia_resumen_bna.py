@@ -244,15 +244,15 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if RE_PERCEP_RG2408.search(u) or RE_PERCEP_RG2408.search(n):
         return "Percepciones de IVA"
 
-    # IVA BNA: "I.V.A. BASE" (en BNA, se utiliza como IVA de intereses/comisiones a 10,5%)
-    if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA BASE" in u) or ("IVA BASE" in n):
-        return "IVA 10,5% (sobre intereses/comisiones)"
-
-    # IVA 21 (si aparece explícito como IVA GRAL / IVA 21 / etc.)
-    if ("IVA GRAL" in u) or ("IVA GRAL" in n) or ("IVA 21" in u) or ("IVA 21" in n):
+    # IVA sobre comisiones (BNA puede usar "I.V.A. BASE")
+    if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n)        or ("I.V.A" in u and "DÉBITO FISCAL" in u) or ("I.V.A" in n and "DEBITO FISCAL" in n):
+        # Si el propio texto indica 10,5, clasifica como 10,5; caso contrario, 21 (comportamiento original)
+        if "10,5" in u or "10,5" in n or "10.5" in u or "10.5" in n:
+            return "IVA 10,5% (sobre comisiones)"
         return "IVA 21% (sobre comisiones)"
 
     # Plazo Fijo (según signo)
+ (según signo)
     if ("PLAZO FIJO" in u) or ("PLAZO FIJO" in n) or ("P.FIJO" in u) or ("P.FIJO" in n) or ("P FIJO" in u) or ("P FIJO" in n):
         if cre and cre != 0:
             return "Acreditación Plazo Fijo"
@@ -460,47 +460,41 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
 
     neto_105_extra = intereses + comision
     iva_105_extra  = iva_base
-    exentos_extra  = sellados + seg_vida
-
-
     # ===== Resumen Operativo (IVA + Otros) =====
     st.caption("Resumen Operativo: Registración Módulo IVA")
 
-    # IVA desde movimientos
-    iva21_mov_mask  = df_sorted["Clasificación"].eq("IVA 21% (sobre comisiones)")
-    iva105_mov_mask = df_sorted["Clasificación"].eq("IVA 10,5% (sobre intereses/comisiones)")
+    iva21_mask  = df_sorted["Clasificación"].eq("IVA 21% (sobre comisiones)")
+    iva105_mask = df_sorted["Clasificación"].eq("IVA 10,5% (sobre comisiones)")
 
-    iva21_mov  = float(df_sorted.loc[iva21_mov_mask, "debito"].sum())
-    iva105_mov = float(df_sorted.loc[iva105_mov_mask, "debito"].sum())
+    iva21  = float(df_sorted.loc[iva21_mask,  "debito"].sum())
+    iva105 = float(df_sorted.loc[iva105_mask, "debito"].sum())
 
-    net21_mov  = round(iva21_mov / 0.21, 2) if iva21_mov else 0.0
-    net105_mov = round(iva105_mov / 0.105, 2) if iva105_mov else 0.0
+    net21  = round(iva21  / 0.21,  2) if iva21  else 0.0
+    net105 = round(iva105 / 0.105, 2) if iva105 else 0.0
 
-    # Ajuste BNA: sumar bloque post SALDO FINAL al 10,5
-    net105 = net105_mov + neto_105_extra
-    iva105 = iva105_mov + iva_105_extra
+    # Ajuste BNA: sumar bloque post SALDO FINAL al 10,5 (solo extras sin fecha)
+    net105 = net105 + float(neto_105_extra or 0.0)
+    iva105 = iva105 + float(iva_105_extra or 0.0)
 
     # Otros conceptos
-    percep_iva_mov = float(df_sorted.loc[df_sorted["Clasificación"].eq("Percepciones de IVA"), "debito"].sum())
-    percep_iva_extra = float(rg3337 or 0.0)
-    percep_iva = percep_iva_mov + percep_iva_extra
+    percep_iva = float(df_sorted.loc[df_sorted["Clasificación"].eq("Percepciones de IVA"), "debito"].sum()) + float(rg3337 or 0.0)
     ley_25413  = float(df_sorted.loc[df_sorted["Clasificación"].eq("LEY 25.413"),          "debito"].sum())
     sircreb    = float(df_sorted.loc[df_sorted["Clasificación"].eq("SIRCREB"),            "debito"].sum())
 
     # Métricas IVA
     m1, m2, m3 = st.columns(3)
     with m1:
-        st.metric("Neto Comisiones 21%", f"$ {fmt_ar(net21_mov)}")
+        st.metric("Neto Comisiones 21%", f"$ {fmt_ar(net21)}")
     with m2:
-        st.metric("IVA 21%", f"$ {fmt_ar(iva21_mov)}")
+        st.metric("IVA 21%", f"$ {fmt_ar(iva21)}")
     with m3:
-        st.metric("Bruto 21%", f"$ {fmt_ar(net21_mov + iva21_mov)}")
+        st.metric("Bruto 21%", f"$ {fmt_ar(net21 + iva21)}")
 
     n1, n2, n3 = st.columns(3)
     with n1:
-        st.metric("Neto 10,5% (incluye post SALDO FINAL)", f"$ {fmt_ar(net105)}")
+        st.metric("Neto Comisiones 10,5%", f"$ {fmt_ar(net105)}")
     with n2:
-        st.metric("IVA 10,5% (incluye I.V.A. BASE post SALDO FINAL)", f"$ {fmt_ar(iva105)}")
+        st.metric("IVA 10,5%", f"$ {fmt_ar(iva105)}")
     with n3:
         st.metric("Bruto 10,5%", f"$ {fmt_ar(net105 + iva105)}")
 
@@ -512,36 +506,7 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
     with o3:
         st.metric("SIRCREB", f"$ {fmt_ar(sircreb)}")
 
-    x1, x2, x3 = st.columns(3)
-    with x1:
-        st.metric("Gastos exentos (post SALDO FINAL)", f"$ {fmt_ar(exentos_extra)}")
-    with x2:
-        st.metric("Total IVA + Impuestos + Percepciones", f"$ {fmt_ar(iva21_mov + iva105 + ley_25413 + sircreb + percep_iva)}")
-    with x3:
-        st.metric("Total general (incluye exentos post SALDO FINAL)", f"$ {fmt_ar(net21_mov + iva21_mov + net105 + iva105 + percep_iva + ley_25413 + sircreb + exentos_extra)}")
-
-    # ----- Gastos post SALDO FINAL (sin fecha) -----
-    st.caption("Gastos post SALDO FINAL (sin fecha)")
-
-    e1, e2, e3 = st.columns(3)
-    with e1:
-        st.metric("Neto 10,5% (Intereses + Comisión)", f"$ {fmt_ar(neto_105_extra)}")
-    with e2:
-        st.metric("IVA 10,5% (I.V.A. BASE)", f"$ {fmt_ar(iva_105_extra)}")
-    with e3:
-        st.metric("Exentos (Sellados + Seguro de vida)", f"$ {fmt_ar(exentos_extra)}")
-
-    extras_rows = [
-        {"Concepto": "INTERESES",      "Tratamiento": "Neto 10,5%", "Importe": intereses},
-        {"Concepto": "COMISION",       "Tratamiento": "Neto 10,5%", "Importe": comision},
-        {"Concepto": "I.V.A. BASE",    "Tratamiento": "IVA 10,5%",  "Importe": iva_base},
-        {"Concepto": "SELLADOS",       "Tratamiento": "Exento",     "Importe": sellados},
-        {"Concepto": "SEGURO DE VIDA", "Tratamiento": "Exento",     "Importe": seg_vida},
-    ]
-    df_extras = pd.DataFrame(extras_rows)
-    df_extras_view = df_extras.copy()
-    df_extras_view["Importe"] = df_extras_view["Importe"].map(fmt_ar)
-    st.dataframe(df_extras_view, use_container_width=True)
+    # ----- Extras post SALDO FINAL (sin fecha) -----
 
     # ----- Detalle de créditos / préstamos (debitados o acreditados) -----
     st.caption("Detalle de créditos / préstamos (debitados o acreditados)")
@@ -585,20 +550,18 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
             df_sorted.to_excel(writer, index=False, sheet_name="Movimientos")
-            df_extras.to_excel(writer, index=False, sheet_name="Gastos_sin_fecha")
             if not df_cred.empty:
                 df_cred.to_excel(writer, index=False, sheet_name="Creditos")
 
             resumen = pd.DataFrame([
-                ["Neto Comisiones 21%", net21_mov],
-                ["IVA 21%", iva21_mov],
+                ["Neto Comisiones 21%", net21],
+                ["IVA 21%", iva21],
                 ["Neto 10,5% (incluye post SALDO FINAL)", net105],
                 ["IVA 10,5% (incluye I.V.A. BASE post SALDO FINAL)", iva105],
                 ["Percepciones de IVA", percep_iva],
                 ["Ley 25.413", ley_25413],
                 ["SIRCREB", sircreb],
-                ["Gastos exentos (post SALDO FINAL)", exentos_extra],
-                ["TOTAL", (net21_mov + iva21_mov + net105 + iva105 + percep_iva + ley_25413 + sircreb + exentos_extra)],
+                ["TOTAL", (net21 + iva21 + net105 + iva105 + percep_iva + ley_25413 + sircreb )],
             ], columns=["Concepto", "Importe"])
             resumen.to_excel(writer, index=False, sheet_name="Resumen_Operativo")
 
@@ -620,11 +583,6 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
             if "fecha" in df_sorted.columns:
                 j = df_sorted.columns.get_loc("fecha")
                 ws.set_column(j, j, 14, date_fmt)
-
-            ws2 = writer.sheets["Gastos_sin_fecha"]
-            ws2.set_column(0, 0, 18)
-            ws2.set_column(1, 1, 18)
-            ws2.set_column(2, 2, 16, money_fmt)
 
             ws3 = writer.sheets["Resumen_Operativo"]
             ws3.set_column(0, 0, 52)
@@ -662,17 +620,16 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
 
             datos = [
                 ["Concepto", "Importe"],
-                ["Neto Comisiones 21%", fmt_ar(net21_mov)],
-                ["IVA 21%", fmt_ar(iva21_mov)],
-                ["Bruto 21%", fmt_ar(net21_mov + iva21_mov)],
+                ["Neto Comisiones 21%", fmt_ar(net21)],
+                ["IVA 21%", fmt_ar(iva21)],
+                ["Bruto 21%", fmt_ar(net21 + iva21)],
                 ["Neto 10,5% (incluye post SALDO FINAL)", fmt_ar(net105)],
                 ["IVA 10,5% (incluye I.V.A. BASE post SALDO FINAL)", fmt_ar(iva105)],
                 ["Bruto 10,5%", fmt_ar(net105 + iva105)],
-                ["Gastos exentos (post SALDO FINAL)", fmt_ar(exentos_extra)],
                 ["Percepciones de IVA", fmt_ar(percep_iva)],
                 ["Ley 25.413", fmt_ar(ley_25413)],
                 ["SIRCREB", fmt_ar(sircreb)],
-                ["TOTAL", fmt_ar(net21_mov + iva21_mov + net105 + iva105 + exentos_extra + percep_iva + ley_25413 + sircreb)],
+                ["TOTAL", fmt_ar(net21 + iva21 + net105 + iva105  + percep_iva + ley_25413 + sircreb)],
             ]
 
             tbl = Table(datos, colWidths=[330, 140])
