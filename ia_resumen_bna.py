@@ -554,6 +554,54 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
             df_cred_view[c] = df_cred_view[c].map(fmt_ar)
         st.dataframe(df_cred_view, use_container_width=True)
 
+        st.caption("Descargar créditos")
+        try:
+            import xlsxwriter  # noqa: F401
+            buf_cred = io.BytesIO()
+            with pd.ExcelWriter(buf_cred, engine="xlsxwriter") as writer:
+                df_cred.to_excel(writer, index=False, sheet_name="Creditos")
+
+                wb = writer.book
+                ws = writer.sheets["Creditos"]
+                money_fmt = wb.add_format({"num_format": "#,##0.00"})
+                date_fmt  = wb.add_format({"num_format": "dd/mm/yyyy"})
+
+                # Anchos de columna
+                for idx, col in enumerate(df_cred.columns):
+                    width = min(max(len(str(col)), 12) + 2, 45)
+                    ws.set_column(idx, idx, width)
+
+                # Formatos numéricos
+                for colname in ["debito", "credito", "importe", "saldo"]:
+                    if colname in df_cred.columns:
+                        j = df_cred.columns.get_loc(colname)
+                        ws.set_column(j, j, 16, money_fmt)
+
+                # Formato fecha
+                if "fecha" in df_cred.columns:
+                    j = df_cred.columns.get_loc("fecha")
+                    ws.set_column(j, j, 14, date_fmt)
+
+            st.download_button(
+                "📥 Descargar Excel – Créditos",
+                data=buf_cred.getvalue(),
+                file_name=f"creditos_bna{acc_suffix}{date_suffix}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"dl_xlsx_creditos_{acc_id}",
+            )
+        except Exception:
+            csv_cred = df_cred.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 Descargar CSV – Créditos (fallback)",
+                data=csv_cred,
+                file_name=f"creditos_bna{acc_suffix}{date_suffix}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key=f"dl_csv_creditos_{acc_id}",
+            )
+
+
     # ----- Detalle de movimientos -----
     st.caption("Detalle de movimientos")
     df_view = df_sorted.copy()
