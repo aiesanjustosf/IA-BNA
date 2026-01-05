@@ -1,0 +1,736 @@
+# ia_resumen_bna.py
+# IA Resumen Bancario – Banco de la Nación Argentina (BNA)
+# Herramienta para uso interno - AIE San Justo
+
+import io
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# ---------------- UI / assets ----------------
+HERE = Path(__file__).parent
+LOGO = HERE / "logo_aie.png"
+FAVICON = HERE / "favicon-aie.ico"
+
+st.set_page_config(
+    page_title="IA Resumen Bancario – Banco Nación",
+    page_icon=str(FAVICON) if FAVICON.exists() else None,
+    layout="wide",
+)
+
+if LOGO.exists():
+    st.image(str(LOGO), width=200)
+
+st.title("IA Resumen Bancario – Banco Nación")
+
+# ---------------- deps diferidas ----------------
+try:
+    import pdfplumber
+except Exception as e:
+    st.error(f"No se pudo importar pdfplumber: {e}\nRevisá requirements.txt")
+    st.stop()
+
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib import colors
+    REPORTLAB_OK = True
+except Exception:
+    REPORTLAB_OK = False
+
+# ---------------- regex base ----------------
+DATE_RE = re.compile(r"\b\d{1,2}/\d{2}/\d{2,4}\b")  # dd/mm/aa o dd/mm/aaaa
+
+# ACEPTA IMPORTES CON SIGNO ADELANTE O GUION ATRÁS:
+# -2.114.972,30   ó   2.114.972,30-
+MONEY_RE = re.compile(
+    r'(?<!\S)-?(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)'
+)
+
+LONG_INT_RE = re.compile(r"\b\d{6,}\b")
+
+# ---------------- BNA: meta + gastos sin fecha ----------------
+BNA_NAME_HINT = "BANCO DE LA NACION ARGENTINA"
+
+BNA_PERIODO_RE = re.compile(
+    r"PERIODO:\s*(\d{2}/\d{2}/\d{4})\s*AL\s*(\d{2}/\d{2}/\d{4})",
+    re.IGNORECASE,
+)
+
+# Variante real BNA: luego del header viene:
+# 4760044071 SAN JUSTO (SF) 0110476320047600440717
+BNA_CUENTA_CBU_RE = re.compile(
+    r"NRO\.\s*CUENTA\s+SUCURSAL\s+CLAVE\s+BANCARIA\s+UNIFORME\s+\(CBU\)\s*[\r\n]+(\d{6,})\s+.+?\s+(\d{22})",
+    re.IGNORECASE,
+)
+
+# Fallback: número de cuenta en caja corta
+BNA_ACC_ONLY_RE = re.compile(
+    r"NRO\.\s*CUENTA\s+SUCURSAL\s*[:\-]?\s*[\r\n ]+(\d{6,})",
+    re.IGNORECASE,
+)
+
+# Bloque de gastos finales post “SALDO FINAL”
+BNA_GASTOS_RE = re.compile(
+    r"-\s*(INTERESES|COMISION|SELLADOS|I\.V\.A\.?\s*BASE|SEGURO\s+DE\s+VIDA)\s*\$\s*([0-9\.\s]+,\d{2})",
+    re.IGNORECASE,
+)
+
+# ---------------- utils ----------------
+def normalize_money(tok: str) -> float:
+    """Normaliza importes argentinos, aceptando:
+    -2.114.972,30   ó   2.114.972,30-
+    """
+    if not tok:
+        return np.nan
+    tok = tok.strip().replace("−", "-")
+    neg = tok.endswith("-") or tok.startswith("-")
+    tok = tok.strip("-")
+    if "," not in tok:
+        return np.nan
+    main, frac = tok.rsplit(",", 1)
+    main = main.replace(".", "").replace(" ", "")
+    try:
+        val = float(f"{main}.{frac}")
+        return -val if neg else val
+    except Exception:
+        return np.nan
+
+
+def fmt_ar(n) -> str:
+    if n is None or (isinstance(n, float) and np.isnan(n)):
+        return "—"
+    return f"{n:,.2f}".replace(",", "§").replace(".", ",").replace("§", ".")
+
+
+def lines_from_text(page):
+    txt = page.extract_text() or ""
+    return [" ".join(l.split()) for l in txt.splitlines()]
+
+
+def lines_from_words(page, ytol=2.0):
+    words = page.extract_words(extra_attrs=["x0", "top"])
+    if not words:
+        return []
+    words.sort(key=lambda w: (round(w["top"] / ytol), w["x0"]))
+    lines, cur, band = [], [], None
+    for w in words:
+        b = round(w["top"] / ytol)
+        if band is None or b == band:
+            cur.append(w)
+        else:
+            lines.append(" ".join(x["text"] for x in cur))
+            cur = [w]
+        band = b
+    if cur:
+        lines.append(" ".join(x["text"] for x in cur))
+    return [" ".join(l.split()) for l in lines]
+
+
+def extract_all_lines(file_like):
+    out = []
+    with pdfplumber.open(file_like) as pdf:
+        for pi, p in enumerate(pdf.pages, start=1):
+            lt = lines_from_text(p)
+            lw = lines_from_words(p, ytol=2.0)
+            seen = set(lt)
+            combined = lt + [l for l in lw if l not in seen]
+            out.extend([(pi, l) for l in combined if l.strip()])
+    return out
+
+
+def _text_from_pdf(file_like) -> str:
+    try:
+        with pdfplumber.open(file_like) as pdf:
+            return "\n".join((p.extract_text() or "") for p in pdf.pages)
+    except Exception:
+        return ""
+
+
+def normalize_desc(desc: str) -> str:
+    if not desc:
+        return ""
+    u = desc.upper()
+    u = LONG_INT_RE.sub("", u)
+    u = " ".join(u.split())
+    return u
+
+
+# ---------------- parsing movimientos ----------------
+def parse_lines(lines) -> pd.DataFrame:
+    rows = []
+    seq = 0  # preserva orden exacto de aparición
+    for ln in lines:
+        if not ln.strip():
+            continue
+        am = list(MONEY_RE.finditer(ln))
+        if len(am) < 2:
+            continue
+        d = DATE_RE.search(ln)
+        if not d or d.end() >= am[0].start():
+            continue
+        saldo = normalize_money(am[-1].group(0))
+        importe = normalize_money(am[-2].group(0))
+        first_money = am[0]
+        desc = ln[d.end(): first_money.start()].strip()
+        seq += 1
+        rows.append({
+            "fecha": pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"),
+            "descripcion": desc,
+            "desc_norm": normalize_desc(desc),
+            "debito": 0.0,
+            "credito": 0.0,
+            "importe": importe,  # informativo; conciliamos por Δ saldo
+            "saldo": saldo,
+            "pagina": 0,
+            "orden": seq,
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------- saldos ----------------
+def _only_one_amount(line: str) -> bool:
+    return len(list(MONEY_RE.finditer(line))) == 1
+
+
+def _first_amount_value(line: str) -> float:
+    m = MONEY_RE.search(line)
+    return normalize_money(m.group(0)) if m else np.nan
+
+
+def find_saldo_final_from_lines(lines):
+    for ln in reversed(lines):
+        if "SALDO FINAL" in ln.upper() and _only_one_amount(ln):
+            saldo = _first_amount_value(ln)
+            if not np.isnan(saldo):
+                return pd.NaT, saldo
+    return pd.NaT, np.nan
+
+
+def find_saldo_anterior_from_lines(lines):
+    for ln in lines:
+        if "SALDO ANTERIOR" in ln.upper() and _only_one_amount(ln):
+            saldo = _first_amount_value(ln)
+            if not np.isnan(saldo):
+                return saldo
+    return np.nan
+
+
+# ---------------- clasificación ----------------
+RE_PERCEP_RG2408 = re.compile(r"PERCEPCI[ÓO]N\s+IVA\s+RG\.?\s*2408", re.IGNORECASE)
+
+def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
+    u = (desc or "").upper()
+    n = (desc_norm or "").upper()
+
+    # Saldos
+    if "SALDO ANTERIOR" in u or "SALDO ANTERIOR" in n:
+        return "SALDO ANTERIOR"
+
+    # Impuesto a los débitos y créditos bancarios
+    if ("LEY 25413" in u) or ("GRAVAMEN LEY 25413" in u) or ("IMPTRANS" in u) or ("IMP.S/CREDS" in u) or \
+       ("LEY 25413" in n) or ("GRAVAMEN LEY 25413" in n) or ("IMPTRANS" in n) or ("IMP.S/CREDS" in n):
+        return "LEY 25.413"
+
+    # SIRCREB
+    if ("SIRCREB" in u) or ("SIRCREB" in n):
+        return "SIRCREB"
+
+    # Percepciones IVA: atajo RG 2408
+    if RE_PERCEP_RG2408.search(u) or RE_PERCEP_RG2408.search(n):
+        return "Percepciones de IVA"
+
+    # IVA BNA: "I.V.A. BASE" (en BNA, se utiliza como IVA de intereses/comisiones a 10,5%)
+    if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA BASE" in u) or ("IVA BASE" in n):
+        return "IVA 10,5% (sobre intereses/comisiones)"
+
+    # IVA 21 (si aparece explícito como IVA GRAL / IVA 21 / etc.)
+    if ("IVA GRAL" in u) or ("IVA GRAL" in n) or ("IVA 21" in u) or ("IVA 21" in n):
+        return "IVA 21% (sobre comisiones)"
+
+    # Plazo Fijo (según signo)
+    if ("PLAZO FIJO" in u) or ("PLAZO FIJO" in n) or ("P.FIJO" in u) or ("P.FIJO" in n) or ("P FIJO" in u) or ("P FIJO" in n):
+        if cre and cre != 0:
+            return "Acreditación Plazo Fijo"
+        if deb and deb != 0:
+            return "Débito Plazo Fijo"
+        return "Plazo Fijo"
+
+    # Comisiones varias
+    if ("COMIS" in u) or ("COMIS" in n):
+        return "Gastos por comisiones"
+
+    # Débitos automáticos
+    if ("DEBITO INMEDIATO" in u) or ("DEBIN" in u):
+        return "Débito automático"
+
+    # ARCA / AFIP / API
+    if ("AFIP" in n or "ARCA" in n) and deb and deb != 0:
+        return "Débitos ARCA"
+    if "API" in n:
+        return "API"
+
+    # Préstamos (BNA suele mostrar "DEBITO PAGO PRESTAMO")
+    if ("PRESTAMO" in n or "PRÉSTAMO" in n):
+        if (deb and deb != 0) and (("DEBITO" in n) or ("DEB" in n) or ("PAGO" in n)):
+            return "Cuota de préstamo"
+        if (cre and cre != 0) and (("CREDITO" in n) or ("CR" in n) or ("ACRED" in n)):
+            return "Acreditación Préstamos"
+        # fallback por signo
+        if cre and cre != 0:
+            return "Acreditación Préstamos"
+        if deb and deb != 0:
+            return "Cuota de préstamo"
+
+    # Tarjetas
+    if ("CR-CABAL" in n) or ("CR CABAL" in n) or ("CR TARJ" in n) or ("PAGO COMERC" in n):
+        return "Acreditaciones Tarjetas de Crédito/Débito"
+
+    # Depósitos
+    if ("DEP.EFECTIVO" in n) or ("DEPOSITO EFECTIVO" in n) or ("DEP EFECTIVO" in n):
+        return "Depósito en Efectivo"
+
+    # Transferencias
+    if (("TRANSFERENCIAS RECIBIDAS" in u) or ("TRANSF RECIB" in n) or ("CR-TRSFE" in n) or ("TRANLINK" in n)) and cre and cre != 0:
+        return "Transferencia de terceros recibida"
+    if (("DB-TRSFE" in n) or ("EMIS TRANSFERENCIA" in n) or ("TRSFE-ET" in n) or ("TRSFE-IT" in n)) and deb and deb != 0:
+        return "Transferencia a terceros realizada"
+    if ("ENTRE CTA" in n) or ("CTA PROPIA" in n):
+        return "Transferencia entre cuentas propias"
+
+    # Valores / cheques
+    if "CH 48 HS" in n or "CH.48 HS" in n or "ECHEQ" in n:
+        return "Cheques / eCheq"
+
+    if cre and cre != 0:
+        return "Crédito"
+    if deb and deb != 0:
+        return "Débito"
+    return "Otros"
+
+
+# ---------------- BNA: meta + gastos finales ----------------
+def bna_extract_meta(file_like):
+    """Devuelve:
+    {'account_number': str|None, 'cbu': str|None, 'period_start': str|None, 'period_end': str|None}
+    """
+    txt = _text_from_pdf(file_like)
+    acc = cbu = pstart = pend = None
+
+    mper = BNA_PERIODO_RE.search(txt)
+    if mper:
+        pstart, pend = mper.group(1), mper.group(2)
+
+    macc = BNA_CUENTA_CBU_RE.search(txt)
+    if macc:
+        acc, cbu = macc.group(1), macc.group(2)
+    else:
+        monly = BNA_ACC_ONLY_RE.search(txt)
+        if monly:
+            acc = monly.group(1)
+
+    return {"account_number": acc, "cbu": cbu, "period_start": pstart, "period_end": pend}
+
+
+def bna_extract_gastos_finales(txt: str) -> dict:
+    """Extrae el bloque posterior a SALDO FINAL:
+    - INTERESES
+    - COMISION
+    - SELLADOS
+    - I.V.A. BASE
+    - SEGURO DE VIDA
+    """
+    scope = txt or ""
+    pos = scope.upper().rfind("SALDO FINAL")
+    if pos != -1:
+        scope = scope[pos:]  # solo desde SALDO FINAL hacia abajo
+
+    out = {}
+    for m in BNA_GASTOS_RE.finditer(scope):
+        etiqueta = m.group(1).upper()
+        importe = normalize_money(m.group(2))
+        if "I.V.A" in etiqueta or "IVA" in etiqueta:
+            etiqueta = "I.V.A. BASE"
+        out[etiqueta] = float(importe) if not np.isnan(importe) else np.nan
+    return out
+
+
+# ---------------- reporte principal ----------------
+def render_bna_report(account_title: str, account_number: str, acc_id: str, lines: list[str], bna_extras: dict):
+    st.markdown("---")
+    st.subheader(f"{account_title} · Nro {account_number}")
+
+    df = parse_lines(lines)
+    fecha_cierre, saldo_final_pdf = find_saldo_final_from_lines(lines)
+    saldo_anterior = find_saldo_anterior_from_lines(lines)
+
+    if df.empty:
+        st.warning("No se detectaron movimientos con fecha en el PDF.")
+        return
+
+    # Insertar SALDO ANTERIOR si existe
+    if not np.isnan(saldo_anterior):
+        first_date = df["fecha"].dropna().min()
+        fecha_apertura = (
+            (first_date - pd.Timedelta(days=1)).normalize()
+            + pd.Timedelta(hours=23, minutes=59, seconds=59)
+            if pd.notna(first_date) else pd.NaT
+        )
+        apertura = pd.DataFrame([{
+            "fecha": fecha_apertura,
+            "descripcion": "SALDO ANTERIOR",
+            "desc_norm": "SALDO ANTERIOR",
+            "debito": 0.0,
+            "credito": 0.0,
+            "importe": 0.0,
+            "saldo": float(saldo_anterior),
+            "pagina": 0,
+            "orden": 0,
+        }])
+        df = pd.concat([apertura, df], ignore_index=True)
+
+    # Débito/Crédito por delta de saldo
+    df = df.sort_values(["fecha", "orden"]).reset_index(drop=True)
+    df["delta_saldo"] = df["saldo"].diff()
+    df["debito"] = np.where(df["delta_saldo"] < 0, -df["delta_saldo"], 0.0)
+    df["credito"] = np.where(df["delta_saldo"] > 0, df["delta_saldo"], 0.0)
+    df["importe"] = df["debito"] - df["credito"]  # signo contable
+
+    # Clasificación
+    df["Clasificación"] = df.apply(
+        lambda r: clasificar(
+            str(r.get("descripcion", "")),
+            str(r.get("desc_norm", "")),
+            float(r.get("debito", 0.0)),
+            float(r.get("credito", 0.0)),
+        ),
+        axis=1,
+    )
+
+    df_sorted = df.drop(columns=["orden"]).reset_index(drop=True)
+
+    # Totales / conciliación
+    saldo_inicial = float(df_sorted.loc[0, "saldo"])
+    total_debitos = float(df_sorted["debito"].sum())
+    total_creditos = float(df_sorted["credito"].sum())
+    saldo_final_visto = float(df_sorted["saldo"].iloc[-1]) if np.isnan(saldo_final_pdf) else float(saldo_final_pdf)
+    saldo_final_calculado = saldo_inicial + total_creditos - total_debitos
+    diferencia = saldo_final_calculado - saldo_final_visto
+    cuadra = abs(diferencia) < 0.01
+
+    st.caption("Resumen del período")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Saldo inicial", f"$ {fmt_ar(saldo_inicial)}")
+    with c2:
+        st.metric("Total créditos (+)", f"$ {fmt_ar(total_creditos)}")
+    with c3:
+        st.metric("Total débitos (–)", f"$ {fmt_ar(total_debitos)}")
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        st.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final_visto)}")
+    with c5:
+        st.metric("Saldo final calculado", f"$ {fmt_ar(saldo_final_calculado)}")
+    with c6:
+        st.metric("Diferencia", f"$ {fmt_ar(diferencia)}")
+
+    try:
+        st.success("Conciliado.") if cuadra else st.error("No cuadra la conciliación.")
+    except Exception:
+        st.write("Conciliación:", "OK" if cuadra else "No cuadra")
+
+    if pd.notna(fecha_cierre):
+        st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
+
+    # ----- Gastos post SALDO FINAL (sin fecha) -----
+    st.caption("Gastos post SALDO FINAL (sin fecha)")
+    intereses = float(bna_extras.get("INTERESES", 0.0) or 0.0)
+    comision  = float(bna_extras.get("COMISION", 0.0) or 0.0)
+    sellados  = float(bna_extras.get("SELLADOS", 0.0) or 0.0)
+    iva_base  = float(bna_extras.get("I.V.A. BASE", 0.0) or 0.0)
+    seg_vida  = float(bna_extras.get("SEGURO DE VIDA", 0.0) or 0.0)
+
+    neto_105_extra = intereses + comision
+    iva_105_extra  = iva_base
+    exentos_extra  = sellados + seg_vida
+
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        st.metric("Neto 10,5% (Intereses + Comisión)", f"$ {fmt_ar(neto_105_extra)}")
+    with e2:
+        st.metric("IVA 10,5% (I.V.A. BASE)", f"$ {fmt_ar(iva_105_extra)}")
+    with e3:
+        st.metric("Exentos (Sellados + Seguro de vida)", f"$ {fmt_ar(exentos_extra)}")
+
+    extras_rows = [
+        {"Concepto": "INTERESES",      "Tratamiento": "Neto 10,5%", "Importe": intereses},
+        {"Concepto": "COMISION",       "Tratamiento": "Neto 10,5%", "Importe": comision},
+        {"Concepto": "I.V.A. BASE",    "Tratamiento": "IVA 10,5%",  "Importe": iva_base},
+        {"Concepto": "SELLADOS",       "Tratamiento": "Exento",     "Importe": sellados},
+        {"Concepto": "SEGURO DE VIDA", "Tratamiento": "Exento",     "Importe": seg_vida},
+    ]
+    df_extras = pd.DataFrame(extras_rows)
+    df_extras_view = df_extras.copy()
+    df_extras_view["Importe"] = df_extras_view["Importe"].map(fmt_ar)
+    st.dataframe(df_extras_view, use_container_width=True)
+
+    # ===== Resumen Operativo (IVA + Otros) =====
+    st.caption("Resumen Operativo: Registración Módulo IVA")
+
+    # IVA desde movimientos
+    iva21_mov_mask  = df_sorted["Clasificación"].eq("IVA 21% (sobre comisiones)")
+    iva105_mov_mask = df_sorted["Clasificación"].eq("IVA 10,5% (sobre intereses/comisiones)")
+
+    iva21_mov  = float(df_sorted.loc[iva21_mov_mask, "debito"].sum())
+    iva105_mov = float(df_sorted.loc[iva105_mov_mask, "debito"].sum())
+
+    net21_mov  = round(iva21_mov / 0.21, 2) if iva21_mov else 0.0
+    net105_mov = round(iva105_mov / 0.105, 2) if iva105_mov else 0.0
+
+    # Ajuste BNA: sumar bloque post SALDO FINAL al 10,5
+    net105 = net105_mov + neto_105_extra
+    iva105 = iva105_mov + iva_105_extra
+
+    # Otros conceptos
+    percep_iva = float(df_sorted.loc[df_sorted["Clasificación"].eq("Percepciones de IVA"), "debito"].sum())
+    ley_25413  = float(df_sorted.loc[df_sorted["Clasificación"].eq("LEY 25.413"),          "debito"].sum())
+    sircreb    = float(df_sorted.loc[df_sorted["Clasificación"].eq("SIRCREB"),            "debito"].sum())
+
+    # Métricas IVA
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("Neto Comisiones 21%", f"$ {fmt_ar(net21_mov)}")
+    with m2:
+        st.metric("IVA 21%", f"$ {fmt_ar(iva21_mov)}")
+    with m3:
+        st.metric("Bruto 21%", f"$ {fmt_ar(net21_mov + iva21_mov)}")
+
+    n1, n2, n3 = st.columns(3)
+    with n1:
+        st.metric("Neto 10,5% (incluye post SALDO FINAL)", f"$ {fmt_ar(net105)}")
+    with n2:
+        st.metric("IVA 10,5% (incluye I.V.A. BASE post SALDO FINAL)", f"$ {fmt_ar(iva105)}")
+    with n3:
+        st.metric("Bruto 10,5%", f"$ {fmt_ar(net105 + iva105)}")
+
+    o1, o2, o3 = st.columns(3)
+    with o1:
+        st.metric("Percepciones de IVA (RG 3337 / RG 2408)", f"$ {fmt_ar(percep_iva)}")
+    with o2:
+        st.metric("Ley 25.413", f"$ {fmt_ar(ley_25413)}")
+    with o3:
+        st.metric("SIRCREB", f"$ {fmt_ar(sircreb)}")
+
+    x1, x2, x3 = st.columns(3)
+    with x1:
+        st.metric("Gastos exentos (post SALDO FINAL)", f"$ {fmt_ar(exentos_extra)}")
+    with x2:
+        st.metric("Total IVA + Impuestos + Percepciones", f"$ {fmt_ar(iva21_mov + iva105 + ley_25413 + sircreb + percep_iva)}")
+    with x3:
+        st.metric("Total general (incluye exentos post SALDO FINAL)", f"$ {fmt_ar(net21_mov + iva21_mov + net105 + iva105 + percep_iva + ley_25413 + sircreb + exentos_extra)}")
+
+    # ----- Detalle de movimientos -----
+    st.caption("Detalle de movimientos")
+    df_view = df_sorted.copy()
+    for c in ["debito", "credito", "importe", "saldo"]:
+        if c in df_view.columns:
+            df_view[c] = df_view[c].map(fmt_ar)
+    st.dataframe(df_view, use_container_width=True)
+
+    # ----- Detalle de créditos / préstamos (debitados o acreditados) -----
+    st.caption("Detalle de créditos / préstamos (debitados o acreditados)")
+    credit_mask = df_sorted["Clasificación"].isin(["Cuota de préstamo", "Acreditación Préstamos"]) | \
+                  df_sorted["desc_norm"].astype(str).str.contains(r"\bPRESTAMO\b|\bPRÉSTAMO\b", case=False, regex=True, na=False)
+    df_cred = df_sorted.loc[credit_mask].copy()
+
+    if df_cred.empty:
+        st.info("No se detectaron movimientos de préstamos en el período.")
+    else:
+        df_cred["Tipo"] = np.where(df_cred["credito"] > 0, "Acreditado", np.where(df_cred["debito"] > 0, "Debitado", "—"))
+        t1, t2, t3 = st.columns(3)
+        with t1:
+            st.metric("Total acreditado", f"$ {fmt_ar(float(df_cred['credito'].sum()))}")
+        with t2:
+            st.metric("Total debitado", f"$ {fmt_ar(float(df_cred['debito'].sum()))}")
+        with t3:
+            st.metric("Neto (acreditado - debitado)", f"$ {fmt_ar(float(df_cred['credito'].sum() - df_cred['debito'].sum()))}")
+
+        df_cred_view = df_cred.copy()
+        for c in ["debito", "credito", "importe", "saldo"]:
+            df_cred_view[c] = df_cred_view[c].map(fmt_ar)
+        st.dataframe(df_cred_view, use_container_width=True)
+
+    # ----- Descargas -----
+    st.caption("Descargar")
+    date_suffix = f"_{fecha_cierre.strftime('%Y%m%d')}" if pd.notna(fecha_cierre) else ""
+    acc_suffix = f"_{account_number}" if account_number and account_number != "s/n" else ""
+
+    # Excel con varias hojas
+    try:
+        import xlsxwriter  # noqa: F401
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            df_sorted.to_excel(writer, index=False, sheet_name="Movimientos")
+            df_extras.to_excel(writer, index=False, sheet_name="Gastos_sin_fecha")
+            if not df_cred.empty:
+                df_cred.to_excel(writer, index=False, sheet_name="Creditos")
+
+            resumen = pd.DataFrame([
+                ["Neto Comisiones 21%", net21_mov],
+                ["IVA 21%", iva21_mov],
+                ["Neto 10,5% (incluye post SALDO FINAL)", net105],
+                ["IVA 10,5% (incluye I.V.A. BASE post SALDO FINAL)", iva105],
+                ["Percepciones de IVA", percep_iva],
+                ["Ley 25.413", ley_25413],
+                ["SIRCREB", sircreb],
+                ["Gastos exentos (post SALDO FINAL)", exentos_extra],
+                ["TOTAL", (net21_mov + iva21_mov + net105 + iva105 + percep_iva + ley_25413 + sircreb + exentos_extra)],
+            ], columns=["Concepto", "Importe"])
+            resumen.to_excel(writer, index=False, sheet_name="Resumen_Operativo")
+
+            wb = writer.book
+            money_fmt = wb.add_format({"num_format": "#,##0.00"})
+            date_fmt = wb.add_format({"num_format": "dd/mm/yyyy"})
+
+            for sh in writer.sheets.values():
+                sh.set_column(0, 0, 16)
+
+            ws = writer.sheets["Movimientos"]
+            for idx, col in enumerate(df_sorted.columns):
+                width = min(max(len(col), 12) + 2, 40)
+                ws.set_column(idx, idx, width)
+            for colname in ["debito", "credito", "importe", "saldo"]:
+                if colname in df_sorted.columns:
+                    j = df_sorted.columns.get_loc(colname)
+                    ws.set_column(j, j, 16, money_fmt)
+            if "fecha" in df_sorted.columns:
+                j = df_sorted.columns.get_loc("fecha")
+                ws.set_column(j, j, 14, date_fmt)
+
+            ws2 = writer.sheets["Gastos_sin_fecha"]
+            ws2.set_column(0, 0, 18)
+            ws2.set_column(1, 1, 18)
+            ws2.set_column(2, 2, 16, money_fmt)
+
+            ws3 = writer.sheets["Resumen_Operativo"]
+            ws3.set_column(0, 0, 52)
+            ws3.set_column(1, 1, 18, money_fmt)
+
+        st.download_button(
+            "📥 Descargar Excel (BNA)",
+            data=output.getvalue(),
+            file_name=f"resumen_bna{acc_suffix}{date_suffix}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"dl_xlsx_{acc_id}",
+        )
+    except Exception:
+        csv_bytes = df_sorted.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "📥 Descargar CSV (fallback)",
+            data=csv_bytes,
+            file_name=f"resumen_bna{acc_suffix}{date_suffix}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=f"dl_csv_{acc_id}",
+        )
+
+    # PDF Resumen Operativo (si reportlab)
+    if REPORTLAB_OK:
+        try:
+            pdf_buf = io.BytesIO()
+            doc = SimpleDocTemplate(pdf_buf, pagesize=A4, title="Resumen Operativo - BNA")
+            styles = getSampleStyleSheet()
+            elems = [
+                Paragraph("Resumen Operativo: Registración Módulo IVA (BNA)", styles["Title"]),
+                Spacer(1, 8),
+            ]
+
+            datos = [
+                ["Concepto", "Importe"],
+                ["Neto Comisiones 21%", fmt_ar(net21_mov)],
+                ["IVA 21%", fmt_ar(iva21_mov)],
+                ["Bruto 21%", fmt_ar(net21_mov + iva21_mov)],
+                ["Neto 10,5% (incluye post SALDO FINAL)", fmt_ar(net105)],
+                ["IVA 10,5% (incluye I.V.A. BASE post SALDO FINAL)", fmt_ar(iva105)],
+                ["Bruto 10,5%", fmt_ar(net105 + iva105)],
+                ["Gastos exentos (post SALDO FINAL)", fmt_ar(exentos_extra)],
+                ["Percepciones de IVA", fmt_ar(percep_iva)],
+                ["Ley 25.413", fmt_ar(ley_25413)],
+                ["SIRCREB", fmt_ar(sircreb)],
+                ["TOTAL", fmt_ar(net21_mov + iva21_mov + net105 + iva105 + exentos_extra + percep_iva + ley_25413 + sircreb)],
+            ]
+
+            tbl = Table(datos, colWidths=[330, 140])
+            tbl.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
+                ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+            ]))
+            elems.append(tbl)
+            elems.append(Spacer(1, 12))
+            elems.append(Paragraph("Herramienta para uso interno - AIE San Justo", styles["Normal"]))
+
+            doc.build(elems)
+
+            st.download_button(
+                "📄 Descargar PDF – Resumen Operativo (BNA)",
+                data=pdf_buf.getvalue(),
+                file_name=f"Resumen_Operativo_BNA{acc_suffix}{date_suffix}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key=f"dl_pdf_{acc_id}",
+            )
+        except Exception as e:
+            st.info(f"No se pudo generar el PDF del Resumen Operativo: {e}")
+
+
+# ---------------- UI principal ----------------
+uploaded = st.file_uploader("Subí un PDF del resumen bancario (Banco Nación)", type=["pdf"])
+if uploaded is None:
+    st.info("La app no almacena datos. Procesamiento local en memoria.")
+    st.stop()
+
+data = uploaded.read()
+txt_full = _text_from_pdf(io.BytesIO(data)).strip()
+
+if not txt_full:
+    st.error(
+        "No se pudo leer texto del PDF. "
+        "Este resumen parece estar escaneado (solo imagen). "
+        "La herramienta solo funciona con PDFs descargados del home banking, "
+        "donde el texto sea seleccionable."
+    )
+    st.stop()
+
+# Verificación suave
+if BNA_NAME_HINT not in txt_full.upper():
+    st.warning("El PDF no parece ser del Banco Nación (BNA). Se intentará procesar igualmente.")
+
+meta = bna_extract_meta(io.BytesIO(data))
+all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
+bna_extras = bna_extract_gastos_finales(txt_full)
+
+# Meta visible
+col1, col2, col3 = st.columns(3)
+if meta.get("period_start") and meta.get("period_end"):
+    with col1:
+        st.caption(f"Período: {meta['period_start']} al {meta['period_end']}")
+if meta.get("account_number"):
+    with col2:
+        st.caption(f"Nro. de cuenta: {meta['account_number']}")
+if meta.get("cbu"):
+    with col3:
+        st.caption(f"CBU: {meta['cbu']}")
+
+titulo = "CUENTA CORRIENTE / CAJA (BNA)"
+nro = meta.get("account_number") or "s/n"
+acc_id = f"bna-{re.sub(r'[^0-9A-Za-z]+', '_', nro)}"
+
+render_bna_report(titulo, nro, acc_id, all_lines, bna_extras)
