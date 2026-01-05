@@ -559,6 +559,11 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
 
         st.caption("Descargar créditos")
 
+        # Sufijos para nombres de archivo (créditos)
+        date_suffix_cred = f"_{fecha_cierre.strftime('%Y%m%d')}" if pd.notna(fecha_cierre) else ""
+        acc_suffix_cred  = f"_{account_number}" if account_number and account_number != "s/n" else ""
+
+
         try:
             import xlsxwriter  # noqa: F401
             buf_cred = io.BytesIO()
@@ -589,7 +594,7 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
             st.download_button(
                 "📥 Descargar Excel – Créditos",
                 data=buf_cred.getvalue(),
-                file_name=f"creditos_bna{acc_suffix}{date_suffix}.xlsx",
+                file_name=f"creditos_bna{acc_suffix_cred}{date_suffix_cred}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
                 key=f"dl_xlsx_creditos_{acc_id}",
@@ -599,7 +604,7 @@ def render_bna_report(account_title: str, account_number: str, acc_id: str, line
             st.download_button(
                 "📥 Descargar CSV – Créditos (fallback)",
                 data=csv_cred,
-                file_name=f"creditos_bna{acc_suffix}{date_suffix}.csv",
+                file_name=f"creditos_bna{acc_suffix_cred}{date_suffix_cred}.csv",
                 mime="text/csv",
                 use_container_width=True,
                 key=f"dl_csv_creditos_{acc_id}",
